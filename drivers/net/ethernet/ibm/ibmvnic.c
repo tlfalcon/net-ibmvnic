@@ -1226,7 +1226,7 @@ static int do_reset(struct ibmvnic_adapter *adapter,
 
 	rc = ibmvnic_init(adapter);
 	if (rc)
-		return 0;
+		return rc;
 
 	/* If the adapter was in PROBE state prior to the reset, exit here. */
 	if (reset_state == VNIC_PROBED)
@@ -1324,7 +1324,10 @@ static void __ibmvnic_reset(struct work_struct *work)
 	}
 
 	if (rc) {
-		free_all_rwi(adapter);
+		if (rc != -2)
+			free_all_rwi(adapter);
+		adapter->state = VNIC_OPEN;
+		mutex_unlock(&adapter->reset_lock);
 		return;
 	}
 
@@ -3162,8 +3165,11 @@ static void ibmvnic_handle_crq(union ibmvnic_crq *crq,
 		switch (gen_crq->cmd) {
 		case IBMVNIC_CRQ_INIT:
 			dev_info(dev, "Partner initialized\n");
-			adapter->from_passive_init = true;
-			complete(&adapter->init_done);
+			if (adapter->sending_init_crq) {
+				adapter->from_passive_init = true;
+				complete(&adapter->init_done);
+			}
+			ibmvnic_reset(adapter, VNIC_RESET_FAILOVER);
 			break;
 		case IBMVNIC_CRQ_INIT_COMPLETE:
 			dev_info(dev, "Partner initialization complete\n");
@@ -3180,7 +3186,6 @@ static void ibmvnic_handle_crq(union ibmvnic_crq *crq,
 			ibmvnic_reset(adapter, VNIC_RESET_MOBILITY);
 		} else if (gen_crq->cmd == IBMVNIC_DEVICE_FAILOVER) {
 			dev_info(dev, "Backing device failover detected\n");
-			ibmvnic_reset(adapter, VNIC_RESET_FAILOVER);
 		} else {
 			/* The adapter lost the connection */
 			dev_err(dev, "Virtual Adapter failed (rc=%d)\n",
@@ -3481,16 +3486,25 @@ static int ibmvnic_init(struct ibmvnic_adapter *adapter)
 	adapter->from_passive_init = false;
 
 	init_completion(&adapter->init_done);
-	ibmvnic_send_crq_init(adapter);
-	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
-		dev_err(dev, "Initialization sequence timed out\n");
+	adapter->sending_init_crq = true;
+	rc = ibmvnic_send_crq_init(adapter);
+	if (rc) {
+		dev_err(dev, "Send init crq failed\n");
 		return -1;
 	}
+
+	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
+		dev_err(dev, "Initialization sequence timed out\n");
+		adapter->sending_init_crq = false;
+		return -1;
+	}
+
+	adapter->sending_init_crq = false;
 
 	if (adapter->from_passive_init) {
 		adapter->state = VNIC_OPEN;
 		adapter->from_passive_init = false;
-		return -1;
+		return -2;
 	}
 
 	rc = init_sub_crqs(adapter);

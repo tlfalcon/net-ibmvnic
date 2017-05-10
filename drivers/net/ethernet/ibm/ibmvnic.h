@@ -1032,5 +1032,5 @@ struct ibmvnic_adapter {
 	struct list_head rwi_list;
 	struct work_struct ibmvnic_reset;
 	bool resetting;
-	bool napi_disabled, from_passive_init;
+	bool napi_disabled, from_passive_init, sending_init_crq;
 };
